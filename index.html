@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Daily Refill</title>
+<script src="https://sdk.minepi.com/pi-sdk.js"></script>
+<style>
+  :root{
+    --bg:#1b1030; --panel:#271845; --ink:#f3edfb; --muted:#b3a4d1;
+    --gold:#f2b632; --gold-ink:#2a1a00; --water:#7b5cff; --line:#3b2a63; --err:#ff8a8a;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%}
+  body{
+    background:var(--bg);color:var(--ink);
+    font:16px/1.5 "Avenir Next","Trebuchet MS",system-ui,sans-serif;
+    padding:env(safe-area-inset-top) 20px calc(env(safe-area-inset-bottom) + 24px);
+    display:flex;justify-content:center;
+  }
+  main{width:100%;max-width:420px;padding-top:28px}
+  h1{font-size:1.5rem;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 24px;min-height:1.5em}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:20px}
+  .wallet{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:16px}
+  .wallet span{color:var(--muted)}
+  .wallet strong{font-size:1.4rem}
+  .tank-row{display:flex;gap:20px;align-items:stretch;margin-bottom:20px}
+  .tank{
+    width:84px;height:200px;border:2px solid var(--muted);border-radius:14px 14px 22px 22px;
+    position:relative;overflow:hidden;flex:none;background:#170d2a;
+  }
+  .fill{
+    position:absolute;left:0;right:0;bottom:0;height:0;
+    background:linear-gradient(var(--water),#5a3fe0);transition:height .9s cubic-bezier(.2,.8,.2,1);
+  }
+  .fill::before{
+    content:"";position:absolute;left:-10%;right:-10%;top:-6px;height:12px;
+    background:var(--water);border-radius:50%;
+  }
+  .ticks{position:absolute;inset:0;pointer-events:none;
+    background:repeating-linear-gradient(to top,transparent 0 24px,rgba(255,255,255,.14) 24px 25px)}
+  .read{display:flex;flex-direction:column;justify-content:center}
+  .num{font-size:3.4rem;font-weight:700;line-height:1;letter-spacing:-.02em}
+  .unit{color:var(--muted);margin-top:6px}
+  .status{margin-top:14px;font-size:.95rem;color:var(--muted)}
+  button{
+    width:100%;font:inherit;font-weight:700;border:0;border-radius:14px;padding:15px;cursor:pointer;
+    background:var(--gold);color:var(--gold-ink);
+  }
+  button:disabled{background:var(--line);color:var(--muted);cursor:not-allowed}
+  button.alt{background:transparent;color:var(--ink);border:1px solid var(--line);margin-top:10px;font-weight:600}
+  button:focus-visible{outline:3px solid #fff;outline-offset:2px}
+  .err{color:var(--err);margin-top:14px;font-size:.95rem}
+  .note{color:var(--muted);font-size:.8rem;margin-top:20px}
+  @media (prefers-reduced-motion:reduce){.fill{transition:none}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Daily Refill</h1>
+  <p class="sub" id="greeting">Connecting to Pi…</p>
+
+  <section class="card" aria-live="polite">
+    <div class="wallet">
+      <span>Pi wallet balance</span>
+      <strong id="piBalance">—</strong>
+    </div>
+
+    <div class="tank-row">
+      <div class="tank" role="img" aria-label="Credit tank">
+        <div class="fill" id="fill"></div>
+        <div class="ticks"></div>
+      </div>
+      <div class="read">
+        <div class="num" id="credits">0</div>
+        <div class="unit">of <span id="max"></span> credits</div>
+        <div class="status" id="status"></div>
+      </div>
+    </div>
+
+    <button id="refillBtn" disabled>Refill credits</button>
+    <button id="useBtn" class="alt" disabled>Use 10 credits</button>
+    <div class="err" id="err" role="alert"></div>
+  </section>
+
+  <p class="note">Credits are stored on this device for demo purposes. For real value, keep them on your server and verify the user with the access token from Pi.authenticate.</p>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---- Config ------------------------------------------------------------
+  const SANDBOX   = true;   // set false in production (mainnet)
+  const MAX       = 100;    // credits in a full tank
+  const COOLDOWN  = 24 * 60 * 60 * 1000;
+  const HORIZON   = SANDBOX ? "https://api.testnet.minepi.com" : "https://api.mainnet.minepi.com";
+
+  // ---- Elements ----------------------------------------------------------
+  const $ = id => document.getElementById(id);
+  const el = {
+    greeting:$("greeting"), pi:$("piBalance"), credits:$("credits"), max:$("max"),
+    fill:$("fill"), status:$("status"), refill:$("refillBtn"), use:$("useBtn"), err:$("err")
+  };
+  el.max.textContent = MAX;
+
+  let user = null, state = { credits: 0, last: 0 }, timer = null;
+
+  // ---- Local credit storage (replace with your backend) -----------------
+  const key = () => "refill:" + (user ? user.uid : "guest");
+  function load(){
+    try { const s = JSON.parse(localStorage.getItem(key())); if (s) state = s; else state = { credits: 0, last: 0 }; }
+    catch { state = { credits: 0, last: 0 }; }
+  }
+  function save(){ try { localStorage.setItem(key(), JSON.stringify(state)); } catch {} }
+
+  // ---- UI ----------------------------------------------------------------
+  function fmtWait(ms){
+    const s = Math.ceil(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return [h, m, sec].map(n => String(n).padStart(2, "0")).join(":");
+  }
+  function render(){
+    el.credits.textContent = state.credits;
+    el.fill.style.height = (state.credits / MAX * 100) + "%";
+    el.use.disabled = !user || state.credits < 10;
+    const wait = state.last + COOLDOWN - Date.now();
+    if (!user) { el.refill.disabled = true; el.status.textContent = ""; return; }
+    if (wait > 0 && state.credits >= 0 && state.last) {
+      el.refill.disabled = true;
+      el.refill.textContent = "Refill in " + fmtWait(wait);
+      el.status.textContent = "Next refill available in " + fmtWait(wait);
+    } else {
+      el.refill.disabled = false;
+      el.refill.textContent = "Refill credits";
+      el.status.textContent = "Refill is ready.";
+    }
+  }
+  function showError(msg){ el.err.textContent = msg || ""; }
+
+  // ---- Pi wallet balance (from the Pi blockchain's public Horizon API) ---
+  async function loadPiBalance(address){
+    if (!address) { el.pi.textContent = "Not shared"; return; }
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10000);
+      const res = await fetch(HORIZON + "/accounts/" + encodeURIComponent(address), { signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.status === 404) { el.pi.textContent = "0 π"; return; }
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const native = (data.balances || []).find(b => b.asset_type === "native");
+      const n = native ? parseFloat(native.balance) : 0;
+      el.pi.textContent = n.toLocaleString(undefined, { maximumFractionDigits: 4 }) + " π";
+    } catch (e) {
+      el.pi.textContent = "Unavailable";
+      showError("Couldn't load your Pi balance. Check your connection and reopen the app.");
+    }
+  }
+
+  // ---- Actions -----------------------------------------------------------
+  el.refill.addEventListener("click", () => {
+    if (Date.now() < state.last + COOLDOWN) return;
+    state.credits = MAX;
+    state.last = Date.now();
+    save(); showError(""); render();
+  });
+  el.use.addEventListener("click", () => {
+    if (state.credits < 10) return;
+    state.credits -= 10; save(); render();
+  });
+
+  // ---- Boot --------------------------------------------------------------
+  async function start(){
+    if (typeof Pi === "undefined") {
+      el.greeting.textContent = "Open this app in the Pi Browser.";
+      showError("The Pi SDK isn't available in this browser.");
+      return;
+    }
+    try {
+      Pi.init({ version: "2.0", sandbox: SANDBOX });
+      // No payments are used here, but authenticate() requires this callback.
+      const auth = await Pi.authenticate(["username", "wallet_address"], () => {});
+      user = auth.user;
+      el.greeting.textContent = "Signed in as @" + user.username;
+      load(); render();
+      timer = setInterval(render, 1000);
+      loadPiBalance(user.wallet_address);
+    } catch (e) {
+      el.greeting.textContent = "Sign-in needed";
+      showError("Pi sign-in failed or was cancelled. Reload and approve the permissions to continue.");
+    }
+  }
+  render();
+  start();
+})();
+</script>
+</body>
+</html>
